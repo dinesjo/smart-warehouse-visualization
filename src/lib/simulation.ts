@@ -203,8 +203,9 @@ export class SimulationEngine {
   private getShelfPosition(location: ShelfLocation | 'conveyor'): Position {
     if (location === 'conveyor') {
       const conveyor = this.wms.getConveyorBelts()[0];
+      // Position robot to the left of the belt, not on it
       return {
-        x: conveyor.position.x + CONVEYOR_WIDTH / 2,
+        x: conveyor.position.x - 30,
         y: conveyor.position.y + CONVEYOR_HEIGHT / 2,
       };
     }
