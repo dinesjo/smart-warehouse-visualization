@@ -603,17 +603,55 @@ class WMS {
         return shelves;
     }
 
-    findEmptyShelfLocation() {
-        for (let shelf of this.shelves) {
-            for (let level = 0; level < WAREHOUSE.SHELF_LEVELS; level++) {
-                for (let pos = 0; pos < WAREHOUSE.SHELF_POSITIONS; pos++) {
-                    if (shelf.levels[level].positions[pos] === null) {
-                        return {
-                            shelf: shelf.id,
-                            level: level,
-                            position: pos,
-                            shelfObj: shelf
-                        };
+    // Simple hash function to convert RFID string to a number
+    hashRFID(rfid) {
+        let hash = 0;
+        for (let i = 0; i < rfid.length; i++) {
+            const char = rfid.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash);
+    }
+
+    findEmptyShelfLocation(rfid = null) {
+        // If RFID is provided, use hash-based distribution to spread boxes across shelves
+        if (rfid) {
+            const hash = this.hashRFID(rfid);
+            const preferredShelfIndex = hash % this.shelves.length;
+
+            // Try to find empty location starting from preferred shelf
+            // Search in a spiral pattern: preferred shelf, then neighbors, expanding outward
+            for (let offset = 0; offset < this.shelves.length; offset++) {
+                const shelfIndex = (preferredShelfIndex + offset) % this.shelves.length;
+                const shelf = this.shelves[shelfIndex];
+
+                for (let level = 0; level < WAREHOUSE.SHELF_LEVELS; level++) {
+                    for (let pos = 0; pos < WAREHOUSE.SHELF_POSITIONS; pos++) {
+                        if (shelf.levels[level].positions[pos] === null) {
+                            return {
+                                shelf: shelf.id,
+                                level: level,
+                                position: pos,
+                                shelfObj: shelf
+                            };
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: sequential search if no RFID provided
+            for (let shelf of this.shelves) {
+                for (let level = 0; level < WAREHOUSE.SHELF_LEVELS; level++) {
+                    for (let pos = 0; pos < WAREHOUSE.SHELF_POSITIONS; pos++) {
+                        if (shelf.levels[level].positions[pos] === null) {
+                            return {
+                                shelf: shelf.id,
+                                level: level,
+                                position: pos,
+                                shelfObj: shelf
+                            };
+                        }
                     }
                 }
             }
@@ -806,8 +844,8 @@ class WMS {
         box.location = 'conveyor';
         this.boxes.set(rfid, box);
 
-        // Assign storage location
-        const location = targetLocation || this.findEmptyShelfLocation();
+        // Assign storage location using hash-based distribution
+        const location = targetLocation || this.findEmptyShelfLocation(rfid);
 
         if (!location) {
             this.log('warning', `No empty shelf space for box ${rfid}`);
