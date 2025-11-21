@@ -20,6 +20,7 @@ const ROBOT_STATE = {
     PICKING_FROM_CONVEYOR: 'picking_from_conveyor',
     MOVING_TO_SHELF: 'moving_to_shelf',
     PLACING_ON_SHELF: 'placing_on_shelf',
+    CLEARING: 'clearing',
     MOVING_TO_FETCH: 'moving_to_fetch',
     PICKING_FROM_SHELF: 'picking_from_shelf',
     MOVING_TO_DELIVERY: 'moving_to_delivery',
@@ -94,6 +95,10 @@ class Robot {
         this.wallFollowDirection = 1; // 1 for counterclockwise, -1 for clockwise
         this.obstacleFollowTimer = 0;
         this.avoidanceOffset = Math.random() * Math.PI * 2; // Random offset for collision resolution
+
+        // Goal coordination (robot-to-robot communication)
+        this.reservedGoal = null; // {x, y, type} - goal this robot has reserved
+        this.clearancePosition = null; // Position to move to after completing task
     }
 
     updateBattery(delta) {
@@ -204,11 +209,14 @@ class Robot {
         for (let robot of allRobots) {
             if (robot.id === this.id) continue;
 
-            // Check if other robot is very close to MY goal
+            // Check if other robot is very close to MY goal or has it reserved
             const distToMyGoal = distance(robot.x, robot.y, this.targetX, this.targetY);
-            if (distToMyGoal < goalCongestedRadius) {
+            const hasReserved = robot.reservedGoal &&
+                                distance(robot.reservedGoal.x, robot.reservedGoal.y, this.targetX, this.targetY) < 20;
+
+            if (distToMyGoal < goalCongestedRadius || hasReserved) {
                 robotsNearGoal++;
-                // If 2 or more robots are already at/near the goal, it's congested
+                // If 2 or more robots are already at/near the goal or have reserved it, it's congested
                 if (robotsNearGoal >= 2) {
                     return true;
                 }
@@ -216,6 +224,16 @@ class Robot {
         }
 
         return false;
+    }
+
+    // Robot-to-robot communication: Reserve a goal
+    reserveGoal(x, y, type) {
+        this.reservedGoal = { x, y, type };
+    }
+
+    // Robot-to-robot communication: Release goal reservation
+    releaseGoal() {
+        this.reservedGoal = null;
     }
 
     update(deltaTime, allRobots = []) {
@@ -521,6 +539,8 @@ class Robot {
         this.carryingBox = null;
         this.armExtended = false;
         this.stuckCounter = 0;
+        this.releaseGoal(); // Release any reserved goals
+        this.clearancePosition = null;
     }
 }
 
@@ -866,6 +886,35 @@ class WMS {
     getActiveRobotsCount() {
         return this.robots.filter(r => r.state !== ROBOT_STATE.IDLE).length;
     }
+
+    // WMS periodic route replanning (PDF Step 7)
+    // Re-analyzes robot positions and recomputes routes when needed
+    replanRoutes() {
+        for (let robot of this.robots) {
+            // Only replan for robots with active tasks
+            if (!robot.currentTask) continue;
+
+            // Skip robots that are performing operations (picking, placing, etc.)
+            const operationalStates = [
+                ROBOT_STATE.IDLE,
+                ROBOT_STATE.PICKING_FROM_CONVEYOR,
+                ROBOT_STATE.PLACING_ON_SHELF,
+                ROBOT_STATE.PICKING_FROM_SHELF,
+                ROBOT_STATE.PLACING_ON_CONVEYOR,
+                ROBOT_STATE.CLEARING,
+                ROBOT_STATE.CHARGING
+            ];
+
+            if (operationalStates.includes(robot.state)) continue;
+
+            // Recompute route if robot seems stuck or has been following same path too long
+            if (robot.stuckCounter > 30) {
+                this.computeRoute(robot, robot.currentTask);
+                robot.pathIndex = 0;
+                robot.stuckCounter = 0; // Reset after replanning
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -944,6 +993,10 @@ class RobotController {
                 this.handlePlacingOnShelf(robot);
                 break;
 
+            case ROBOT_STATE.CLEARING:
+                this.handleClearing(robot, deltaTime);
+                break;
+
             case ROBOT_STATE.MOVING_TO_FETCH:
                 this.handleMovingToFetch(robot, deltaTime);
                 break;
@@ -977,12 +1030,36 @@ class RobotController {
         // Check if robot has a task
         if (robot.currentTask) {
             if (robot.currentTask.type === 'store') {
+                // Reserve the collection point goal
+                const collectionPoint = this.wms.collectionPoints[0];
+                robot.reserveGoal(collectionPoint.x + 80, collectionPoint.y, 'collection');
+
                 robot.state = ROBOT_STATE.MOVING_TO_COLLECTION;
                 this.wms.log('success', `Robot ${robot.id} assigned to store box`);
             } else if (robot.currentTask.type === 'fetch') {
+                // Reserve the shelf goal
+                const coords = this.wms.getShelfCoordinates(
+                    robot.currentTask.location.shelf,
+                    robot.currentTask.location.level,
+                    robot.currentTask.location.position
+                );
+                if (coords) {
+                    robot.reserveGoal(coords.x, coords.y, 'shelf');
+                }
+
                 robot.state = ROBOT_STATE.MOVING_TO_FETCH;
                 this.wms.log('success', `Robot ${robot.id} assigned to fetch box`);
             }
+        }
+    }
+
+    handleClearing(robot, deltaTime) {
+        // Move to clearance position, then go idle
+        robot.update(deltaTime, this.wms.robots);
+
+        if (robot.isAtTarget()) {
+            robot.reset(); // Now safe to go idle
+            this.wms.log('info', `Robot ${robot.id} cleared area, now idle`);
         }
     }
 
@@ -1032,6 +1109,19 @@ class RobotController {
         this.wms.conveyorBoxes.splice(conveyorBoxIndex, 1);
 
         robot.armExtended = false;
+        robot.releaseGoal(); // Release collection point goal
+
+        // Now reserve the shelf goal for placing
+        const task = robot.currentTask;
+        const coords = this.wms.getShelfCoordinates(
+            task.location.shelf,
+            task.location.level,
+            task.location.position
+        );
+        if (coords) {
+            robot.reserveGoal(coords.x, coords.y, 'shelf');
+        }
+
         robot.state = ROBOT_STATE.MOVING_TO_SHELF;
 
         // Resume conveyor belt (PDF requirement)
@@ -1089,7 +1179,25 @@ class RobotController {
 
         robot.carryingBox = null;
         robot.armExtended = false;
-        robot.reset();
+
+        // Calculate clearance position - move away from shelf vertically
+        const coords = this.wms.getShelfCoordinates(
+            task.location.shelf,
+            task.location.level,
+            task.location.position
+        );
+
+        if (coords) {
+            // Move 150 pixels away from shelf (down if top row, up if bottom row)
+            const clearanceY = shelf.row === 0 ? coords.shelfY + 150 : coords.shelfY - 50;
+            robot.clearancePosition = { x: coords.x, y: clearanceY };
+            robot.moveTo(coords.x, clearanceY);
+            robot.state = ROBOT_STATE.CLEARING;
+            robot.currentTask = null; // Clear task
+            robot.releaseGoal(); // Release the shelf goal
+        } else {
+            robot.reset();
+        }
     }
 
     handleMovingToFetch(robot, deltaTime) {
@@ -1138,6 +1246,13 @@ class RobotController {
         if (rfid) {
             robot.carryingBox = this.wms.boxes.get(rfid);
             robot.carryingBox.location = 'robot';
+
+            robot.releaseGoal(); // Release shelf goal
+
+            // Reserve delivery point goal
+            const deliveryPoint = this.wms.collectionPoints[1];
+            robot.reserveGoal(deliveryPoint.x + 80, deliveryPoint.y, 'delivery');
+
             robot.state = ROBOT_STATE.MOVING_TO_DELIVERY;
 
             this.wms.log('success',
@@ -1174,7 +1289,15 @@ class RobotController {
 
         robot.carryingBox = null;
         robot.armExtended = false;
-        robot.reset();
+        robot.releaseGoal(); // Release delivery point goal
+
+        // Move to clearance position - move away from delivery point
+        const deliveryPoint = this.wms.collectionPoints[1];
+        const clearanceY = deliveryPoint.y - 100; // Move up from bottom delivery point
+        robot.clearancePosition = { x: deliveryPoint.x + 80, y: clearanceY };
+        robot.moveTo(deliveryPoint.x + 80, clearanceY);
+        robot.state = ROBOT_STATE.CLEARING;
+        robot.currentTask = null; // Clear task
     }
 
     handleMovingToCharging(robot, deltaTime) {
@@ -1582,6 +1705,15 @@ class WarehouseSimulation {
 
         // Process task queue
         this.wms.processTaskQueue();
+
+        // WMS periodic route replanning (PDF Step 7)
+        // Replan routes every ~60 frames to resolve conflicts
+        if (!this.replanCounter) this.replanCounter = 0;
+        this.replanCounter++;
+        if (this.replanCounter >= 60) {
+            this.wms.replanRoutes();
+            this.replanCounter = 0;
+        }
     }
 
     render() {
