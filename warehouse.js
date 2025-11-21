@@ -84,6 +84,15 @@ class Robot {
         this.radarRange = 60; // Detection range for obstacles
         this.safeDistance = 40; // Minimum safe distance from obstacles
         this.diagnosticMessages = [];
+
+        // Bug2 algorithm state
+        this.bug2Mode = 'go-to-goal'; // 'go-to-goal' or 'wall-following'
+        this.mLineStart = { x: x, y: y }; // Start point of m-line
+        this.mLineGoal = { x: x, y: y }; // Goal point of m-line
+        this.hitPoint = null; // Point where obstacle was first hit
+        this.hitPointDistance = Infinity; // Distance from hit point to goal
+        this.wallFollowDirection = 1; // 1 for counterclockwise, -1 for clockwise
+        this.obstacleFollowTimer = 0;
     }
 
     updateBattery(delta) {
@@ -112,42 +121,182 @@ class Robot {
     moveTo(targetX, targetY) {
         this.targetX = targetX;
         this.targetY = targetY;
+
+        // Reset Bug2 state for new target
+        this.bug2Mode = 'go-to-goal';
+        this.mLineStart = { x: this.x, y: this.y };
+        this.mLineGoal = { x: targetX, y: targetY };
+        this.hitPoint = null;
+        this.hitPointDistance = Infinity;
+        this.obstacleFollowTimer = 0;
+    }
+
+    // Bug2: Calculate distance from point to m-line (line from start to goal)
+    distanceToMLine(px, py) {
+        const x1 = this.mLineStart.x;
+        const y1 = this.mLineStart.y;
+        const x2 = this.mLineGoal.x;
+        const y2 = this.mLineGoal.y;
+
+        const A = py - y1;
+        const B = px - x1;
+        const C = y2 - y1;
+        const D = x2 - x1;
+
+        const dot = A * C + B * D;
+        const lenSq = C * C + D * D;
+
+        if (lenSq === 0) return distance(px, py, x1, y1);
+
+        const param = dot / lenSq;
+
+        let xx, yy;
+
+        if (param < 0) {
+            xx = x1;
+            yy = y1;
+        } else if (param > 1) {
+            xx = x2;
+            yy = y2;
+        } else {
+            xx = x1 + param * D;
+            yy = y1 + param * C;
+        }
+
+        return distance(px, py, xx, yy);
+    }
+
+    // Bug2: Check if current position is on m-line and closer to goal
+    isOnMLineAndCloser() {
+        const distToLine = this.distanceToMLine(this.x, this.y);
+        const distToGoal = distance(this.x, this.y, this.mLineGoal.x, this.mLineGoal.y);
+
+        // On m-line if distance is small, and closer to goal than hit point
+        return distToLine < 10 && distToGoal < this.hitPointDistance - 5;
+    }
+
+    // Bug2: Calculate wall-following direction (tangent to obstacle)
+    calculateWallFollowDirection(obstacle) {
+        // Vector from obstacle to robot
+        const dx = this.x - obstacle.x;
+        const dy = this.y - obstacle.y;
+
+        // Perpendicular vector (tangent) - rotate 90 degrees
+        const tangentX = -dy * this.wallFollowDirection;
+        const tangentY = dx * this.wallFollowDirection;
+
+        // Normalize
+        const len = Math.sqrt(tangentX * tangentX + tangentY * tangentY);
+        if (len === 0) return { x: 0, y: 0 };
+
+        return {
+            x: tangentX / len,
+            y: tangentY / len
+        };
     }
 
     update(deltaTime, allRobots = []) {
-        // Update position towards target
+        // Update position towards target using Bug2 algorithm
         const dx = this.targetX - this.x;
         const dy = this.targetY - this.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
 
         if (dist > 1) {
-            // Check radar for safety (PDF requirement)
-            const safeToMove = allRobots.length > 0 ? this.isSafeToMove(allRobots) : true;
+            // Detect obstacles
+            const obstacles = this.detectObstacles(allRobots);
+            const closestObstacle = this.getClosestObstacleInDirection(obstacles, dx, dy);
 
-            if (!safeToMove) {
-                // Stop or slow down due to obstacle
-                this.stuckCounter++;
-                if (this.stuckCounter > 50) {
-                    this.sendDiagnostic(`Robot ${this.id} blocked by obstacle for extended time`, 'warning');
+            // Bug2 Algorithm State Machine
+            if (this.bug2Mode === 'go-to-goal') {
+                // Try to move directly toward goal
+                if (closestObstacle && closestObstacle.distance < this.safeDistance) {
+                    // Hit an obstacle - switch to wall-following mode
+                    this.bug2Mode = 'wall-following';
+                    this.hitPoint = { x: this.x, y: this.y };
+                    this.hitPointDistance = distance(this.x, this.y, this.mLineGoal.x, this.mLineGoal.y);
+                    this.obstacleFollowTimer = 0;
+
+                    // Determine wall follow direction (choose direction that moves toward goal)
+                    const toGoalAngle = Math.atan2(dy, dx);
+                    const toObstacleAngle = Math.atan2(
+                        closestObstacle.robot.y - this.y,
+                        closestObstacle.robot.x - this.x
+                    );
+                    const angleDiff = toGoalAngle - toObstacleAngle;
+                    this.wallFollowDirection = angleDiff > 0 ? 1 : -1;
+
+                    this.stuckCounter++;
+                } else {
+                    // No obstacle, move toward goal
+                    const moveDistance = Math.min(this.speed * deltaTime, dist);
+                    this.x += (dx / dist) * moveDistance;
+                    this.y += (dy / dist) * moveDistance;
+                    this.angle = Math.atan2(dy, dx);
+                    this.consumeBatteryForMovement(moveDistance);
+                    this.stuckCounter = 0;
                 }
-                return false; // Cannot move, obstacle detected
+
+            } else if (this.bug2Mode === 'wall-following') {
+                // Follow the obstacle boundary
+                this.obstacleFollowTimer++;
+
+                // Check if back on m-line and closer to goal
+                if (this.obstacleFollowTimer > 20 && this.isOnMLineAndCloser()) {
+                    // Leave wall and go back to goal mode
+                    this.bug2Mode = 'go-to-goal';
+                    this.hitPoint = null;
+                    this.stuckCounter = 0;
+                } else if (closestObstacle) {
+                    // Calculate tangent direction (perpendicular to obstacle)
+                    const tangent = this.calculateWallFollowDirection(closestObstacle.robot);
+
+                    // Also consider goal direction to bias movement
+                    const goalWeight = 0.3;
+                    const tangentWeight = 0.7;
+
+                    let moveX = tangent.x * tangentWeight + (dx / dist) * goalWeight;
+                    let moveY = tangent.y * tangentWeight + (dy / dist) * goalWeight;
+
+                    // Normalize combined vector
+                    const moveLen = Math.sqrt(moveX * moveX + moveY * moveY);
+                    if (moveLen > 0) {
+                        moveX /= moveLen;
+                        moveY /= moveLen;
+                    }
+
+                    // Check if this direction is safe
+                    const testDist = distance(
+                        this.x + moveX * 20,
+                        this.y + moveY * 20,
+                        closestObstacle.robot.x,
+                        closestObstacle.robot.y
+                    );
+
+                    if (testDist > this.safeDistance - 10) {
+                        // Safe to move in this direction
+                        const moveDistance = Math.min(this.speed * deltaTime * 0.8, dist);
+                        this.x += moveX * moveDistance;
+                        this.y += moveY * moveDistance;
+                        this.angle = Math.atan2(moveY, moveX);
+                        this.consumeBatteryForMovement(moveDistance);
+                        this.stuckCounter = Math.max(0, this.stuckCounter - 1);
+                    } else {
+                        // Still too close, try flipping direction
+                        if (this.obstacleFollowTimer % 30 === 0) {
+                            this.wallFollowDirection *= -1;
+                        }
+                        this.stuckCounter++;
+                    }
+                } else {
+                    // Lost the obstacle - go back to goal mode
+                    this.bug2Mode = 'go-to-goal';
+                    this.hitPoint = null;
+                }
             }
 
-            const moveDistance = Math.min(this.speed * deltaTime, dist);
-            this.x += (dx / dist) * moveDistance;
-            this.y += (dy / dist) * moveDistance;
-
-            // Update angle
-            this.angle = Math.atan2(dy, dx);
-
-            // Consume battery
-            this.consumeBatteryForMovement(moveDistance);
-
-            // Check if stuck
+            // Track movement for stuck detection
             if (Math.abs(this.x - this.lastX) < 0.1 && Math.abs(this.y - this.lastY) < 0.1) {
                 this.stuckCounter++;
-            } else {
-                this.stuckCounter = 0;
             }
 
             this.lastX = this.x;
@@ -156,8 +305,40 @@ class Robot {
             return false; // Not reached target
         }
 
+        // Reached target
         this.stuckCounter = 0;
-        return true; // Reached target
+        this.bug2Mode = 'go-to-goal';
+        return true;
+    }
+
+    // Get closest obstacle in the direction of movement
+    getClosestObstacleInDirection(obstacles, dx, dy) {
+        let closest = null;
+        let minDist = Infinity;
+
+        for (let obs of obstacles) {
+            // Check if obstacle is roughly in the direction we're heading
+            const obsX = obs.robot.x - this.x;
+            const obsY = obs.robot.y - this.y;
+
+            // Dot product to check direction
+            const dirLen = Math.sqrt(dx * dx + dy * dy);
+            const obsLen = Math.sqrt(obsX * obsX + obsY * obsY);
+
+            if (dirLen === 0 || obsLen === 0) continue;
+
+            const dot = (dx * obsX + dy * obsY) / (dirLen * obsLen);
+
+            // If obstacle is ahead (dot > 0) or very close
+            if (dot > -0.3 || obs.distance < this.safeDistance) {
+                if (obs.distance < minDist) {
+                    minDist = obs.distance;
+                    closest = obs;
+                }
+            }
+        }
+
+        return closest;
     }
 
     followPath() {
@@ -204,31 +385,6 @@ class Robot {
             }
         }
         return obstacles;
-    }
-
-    // Check if safe to move forward
-    isSafeToMove(allRobots) {
-        const obstacles = this.detectObstacles(allRobots);
-
-        // Check if any obstacle is too close in our direction
-        for (let obs of obstacles) {
-            if (obs.distance < this.safeDistance) {
-                // Check if obstacle is in our path direction
-                const dx = this.targetX - this.x;
-                const dy = this.targetY - this.y;
-                const dxObs = obs.robot.x - this.x;
-                const dyObs = obs.robot.y - this.y;
-
-                // Dot product to check if in same direction
-                const dot = (dx * dxObs + dy * dyObs) /
-                           (Math.sqrt(dx*dx + dy*dy) * Math.sqrt(dxObs*dxObs + dyObs*dyObs));
-
-                if (dot > 0.5) { // Obstacle is ahead
-                    return false;
-                }
-            }
-        }
-        return true;
     }
 
     // Send diagnostic message to WMS
