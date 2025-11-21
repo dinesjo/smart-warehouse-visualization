@@ -159,6 +159,13 @@ export class SimulationEngine {
         (pos) => pos !== robot.position
       );
 
+      // Sync route from WMS to robot instance (only if robot doesn't already have a route)
+      const robotStatus = this.wms.getRobots().find((r) => r.id === robotId);
+      if (robotStatus?.route && robotStatus.route.length > 0 && !robot.route && robot.status === 'idle') {
+        // Robot has a route in WMS but not in instance, and robot is idle - sync it
+        robot.setRoute(robotStatus.route);
+      }
+
       // Check if robot needs charging
       if (robot.needsCharging() && robot.status !== 'charging') {
         this.wms.sendRobotToCharge(robotId);
@@ -168,8 +175,8 @@ export class SimulationEngine {
         }
       }
 
-      // Update robot
-      robot.update(deltaTime / 16, otherPositions); // Normalize to ~60fps
+      // Update robot - deltaTime is already in milliseconds
+      robot.update(deltaTime, otherPositions);
 
       // Update robot position in WMS
       this.wms.updateRobotPosition(robotId, robot.position);
@@ -214,6 +221,13 @@ export class SimulationEngine {
     };
   }
 
+  private isRobotNearLocation(robotPos: Position, targetPos: Position, threshold: number = 50): boolean {
+    const dx = robotPos.x - targetPos.x;
+    const dy = robotPos.y - targetPos.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    return distance < threshold;
+  }
+
   private processRobotAssignment(robot: Robot): void {
     const robotStatus = this.wms.getRobots().find((r) => r.id === robot.id);
     if (!robotStatus?.assignment || robot.status !== 'idle') return;
@@ -223,6 +237,12 @@ export class SimulationEngine {
     if (assignment.type === 'store') {
       // Robot should pick from conveyor and store on shelf
       if (!robot.hasBox) {
+        // Check if robot is near the conveyor before picking
+        const conveyorPos = this.getShelfPosition('conveyor');
+        if (!this.isRobotNearLocation(robot.position, conveyorPos)) {
+          return; // Robot not at conveyor yet
+        }
+
         // Pick from conveyor
         const box = this.wms.getBoxes().find(
           (b) => b.rfid === assignment.boxRfid && b.location === 'conveyor'
@@ -250,6 +270,12 @@ export class SimulationEngine {
           }
         }
       } else if (robot.currentBox && assignment.targetLocation !== 'conveyor') {
+        // Check if robot is near the shelf before placing
+        const shelfPos = this.getShelfPosition(assignment.targetLocation);
+        if (!this.isRobotNearLocation(robot.position, shelfPos)) {
+          return; // Robot not at shelf yet
+        }
+
         // Place on shelf
         const placedBox = robot.placeBox();
         if (placedBox) {
@@ -267,6 +293,12 @@ export class SimulationEngine {
     } else if (assignment.type === 'fetch') {
       // Robot should fetch from shelf and place on conveyor
       if (!robot.hasBox && assignment.sourceLocation !== 'conveyor') {
+        // Check if robot is near the shelf before picking
+        const shelfPos = this.getShelfPosition(assignment.sourceLocation);
+        if (!this.isRobotNearLocation(robot.position, shelfPos)) {
+          return; // Robot not at shelf yet
+        }
+
         // Pick from shelf
         const box = this.wms.removeBoxFromShelf(assignment.sourceLocation);
         if (box) {
@@ -278,6 +310,12 @@ export class SimulationEngine {
           robot.setRoute([targetPos]);
         }
       } else if (robot.hasBox) {
+        // Check if robot is near the conveyor before placing
+        const conveyorPos = this.getShelfPosition('conveyor');
+        if (!this.isRobotNearLocation(robot.position, conveyorPos)) {
+          return; // Robot not at conveyor yet
+        }
+
         // Place on conveyor
         const placedBox = robot.placeBox();
         if (placedBox) {

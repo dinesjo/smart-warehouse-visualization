@@ -46,7 +46,11 @@ export class Robot {
       const dy = this.targetPosition.y - this.position.y;
       const distance = Math.sqrt(dx * dx + dy * dy);
 
-      if (distance < ROBOT_SPEED) {
+      // Calculate movement distance based on deltaTime (in milliseconds)
+      // ROBOT_SPEED is pixels per frame at 60fps, so multiply by deltaTime normalized to 60fps
+      const moveDistance = ROBOT_SPEED * (deltaTime / (1000 / 60));
+
+      if (distance < moveDistance) {
         // Reached target
         this.position = { ...this.targetPosition };
         this.status = 'idle';
@@ -60,8 +64,8 @@ export class Robot {
         }
 
         // Move towards target
-        const moveX = (dx / distance) * ROBOT_SPEED;
-        const moveY = (dy / distance) * ROBOT_SPEED;
+        const moveX = (dx / distance) * moveDistance;
+        const moveY = (dy / distance) * moveDistance;
 
         this.position.x += moveX;
         this.position.y += moveY;
@@ -76,7 +80,7 @@ export class Robot {
       }
     } else if (this.status === 'charging') {
       // Charge battery
-      this.batteryLevel += 0.5;
+      this.batteryLevel += 0.5 * (deltaTime / (1000 / 60));
       if (this.batteryLevel >= 100) {
         this.batteryLevel = 100;
         this.status = 'idle';

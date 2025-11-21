@@ -187,7 +187,7 @@ export class WarehouseManagementSystem {
       const task = this.pendingTasks.shift();
       if (task) {
         idleRobot.assignment = task;
-        idleRobot.status = 'moving';
+        // Don't set status here - let the Robot instance handle it when route is synced
         this.computeRoute(idleRobot);
       }
     }

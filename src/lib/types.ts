@@ -91,7 +91,7 @@ export const CONVEYOR_WIDTH = 100;
 export const CONVEYOR_HEIGHT = 20;
 
 // Robot constants
-export const ROBOT_SPEED = 2; // pixels per frame
+export const ROBOT_SPEED = 3.5; // pixels per frame at 60fps
 export const BATTERY_CONSUMPTION_MOVE = 0.01; // per pixel
 export const BATTERY_CONSUMPTION_ARM = 2; // per operation
 export const LOW_BATTERY_THRESHOLD = 20;
