@@ -12,8 +12,9 @@ import type {
   Box,
   Position,
   RobotAssignment,
+  ShelfLocation,
 } from './types';
-import { WAREHOUSE_CONFIG } from './types';
+import { WAREHOUSE_CONFIG, CONVEYOR_WIDTH, CONVEYOR_HEIGHT } from './types';
 
 export interface SimulationState {
   isRunning: boolean;
@@ -192,6 +193,27 @@ export class SimulationEngine {
     this.updateStatistics();
   }
 
+  private getShelfPosition(location: ShelfLocation | 'conveyor'): Position {
+    if (location === 'conveyor') {
+      const conveyor = this.wms.getConveyorBelts()[0];
+      return {
+        x: conveyor.position.x + CONVEYOR_WIDTH / 2,
+        y: conveyor.position.y + CONVEYOR_HEIGHT / 2,
+      };
+    }
+
+    const shelf = this.wms.getShelves().find((s) => s.id === location.shelf);
+    if (!shelf) {
+      throw new Error('Invalid shelf');
+    }
+
+    // Return position in front of shelf
+    return {
+      x: shelf.position.x + 20,
+      y: shelf.position.y - 40,
+    };
+  }
+
   private processRobotAssignment(robot: Robot): void {
     const robotStatus = this.wms.getRobots().find((r) => r.id === robot.id);
     if (!robotStatus?.assignment || robot.status !== 'idle') return;
@@ -209,6 +231,23 @@ export class SimulationEngine {
           robot.pickBox(box);
           box.location = 'robot';
           box.robotId = robot.id;
+
+          // Remove box from conveyor
+          const conveyors = this.wms.getConveyorBelts();
+          for (const conveyor of conveyors) {
+            const boxIndex = conveyor.boxes.findIndex((b) => b.rfid === box.rfid);
+            if (boxIndex !== -1) {
+              conveyor.boxes.splice(boxIndex, 1);
+              break;
+            }
+          }
+
+          // Set route to target shelf
+          const robotStatus = this.wms.getRobots().find((r) => r.id === robot.id);
+          if (robotStatus && assignment.targetLocation !== 'conveyor') {
+            const targetPos = this.getShelfPosition(assignment.targetLocation);
+            robot.setRoute([targetPos]);
+          }
         }
       } else if (robot.currentBox && assignment.targetLocation !== 'conveyor') {
         // Place on shelf
@@ -233,6 +272,10 @@ export class SimulationEngine {
         if (box) {
           robot.pickBox(box);
           box.robotId = robot.id;
+
+          // Set route to conveyor
+          const targetPos = this.getShelfPosition('conveyor');
+          robot.setRoute([targetPos]);
         }
       } else if (robot.hasBox) {
         // Place on conveyor
