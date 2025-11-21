@@ -99,6 +99,11 @@ class Robot {
         // Goal coordination (robot-to-robot communication)
         this.reservedGoal = null; // {x, y, type} - goal this robot has reserved
         this.clearancePosition = null; // Position to move to after completing task
+
+        // Stationary obstacle handling
+        this.blockedByRobotId = null; // ID of robot currently blocking us
+        this.blockedByStaticCounter = 0; // How long we've been blocked by a stationary robot
+        this.staticObstacleTimeout = 60; // Frames to wait before forcing through stationary obstacle
     }
 
     updateBattery(delta) {
@@ -135,6 +140,8 @@ class Robot {
         this.hitPoint = null;
         this.hitPointDistance = Infinity;
         this.obstacleFollowTimer = 0;
+        this.blockedByRobotId = null;
+        this.blockedByStaticCounter = 0;
     }
 
     // Bug2: Calculate distance from point to m-line (line from start to goal)
@@ -252,6 +259,29 @@ class Robot {
             const obstacles = this.detectObstacles(allRobots);
             const closestObstacle = this.getClosestObstacleInDirection(obstacles, dx, dy);
 
+            // Track stationary obstacles blocking us
+            if (closestObstacle && closestObstacle.isStatic) {
+                if (this.blockedByRobotId === closestObstacle.robot.id) {
+                    // Still blocked by the same stationary robot
+                    this.blockedByStaticCounter++;
+                } else {
+                    // New stationary robot is blocking us
+                    this.blockedByRobotId = closestObstacle.robot.id;
+                    this.blockedByStaticCounter = 1;
+                }
+            } else if (closestObstacle && !closestObstacle.isStatic) {
+                // Blocked by a moving robot - reset static counter
+                this.blockedByRobotId = null;
+                this.blockedByStaticCounter = 0;
+            } else {
+                // No obstacle - reset tracking
+                this.blockedByRobotId = null;
+                this.blockedByStaticCounter = 0;
+            }
+
+            // Check if we've been blocked by a stationary obstacle for too long
+            const stuckOnStatic = this.blockedByStaticCounter > this.staticObstacleTimeout;
+
             // Check if goal area is congested (other robots very close to our goal)
             const goalAreaCongested = this.isGoalAreaCongested(allRobots);
 
@@ -305,27 +335,92 @@ class Robot {
                     this.stuckCounter = Math.max(0, this.stuckCounter - 1);
 
                 } else if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance && !veryCloseToGoal) {
-                    // Hit an obstacle - switch to wall-following mode
-                    this.bug2Mode = 'wall-following';
-                    this.hitPoint = { x: this.x, y: this.y };
-                    this.hitPointDistance = distance(this.x, this.y, this.mLineGoal.x, this.mLineGoal.y);
-                    this.obstacleFollowTimer = 0;
+                    // If stuck on a stationary robot for too long, try to push through
+                    if (stuckOnStatic && closestObstacle.isStatic) {
+                        // Reduce safe distance significantly to try to navigate around
+                        const reducedSafeDistance = 15; // Very tight squeeze
 
-                    // Determine wall follow direction with randomization to break symmetry
-                    const toGoalAngle = Math.atan2(dy, dx);
-                    const toObstacleAngle = Math.atan2(
-                        closestObstacle.robot.y - this.y,
-                        closestObstacle.robot.x - this.x
-                    );
-                    let angleDiff = toGoalAngle - toObstacleAngle + this.avoidanceOffset * 0.1;
+                        if (closestObstacle.distance < reducedSafeDistance) {
+                            // Still too close even with reduced distance - try to move around
+                            const avoidX = this.x - closestObstacle.robot.x;
+                            const avoidY = this.y - closestObstacle.robot.y;
+                            const avoidLen = Math.sqrt(avoidX * avoidX + avoidY * avoidY);
 
-                    // Normalize angle difference
-                    while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
-                    while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+                            if (avoidLen > 0) {
+                                // Move perpendicular to the obstacle while heading toward goal
+                                let moveX = dx / dist * 0.5; // Half toward goal
+                                let moveY = dy / dist * 0.5;
 
-                    this.wallFollowDirection = angleDiff > 0 ? 1 : -1;
+                                // Add strong perpendicular component
+                                const perpX = -avoidY / avoidLen;
+                                const perpY = avoidX / avoidLen;
 
-                    this.stuckCounter++;
+                                moveX += perpX * 0.5;
+                                moveY += perpY * 0.5;
+
+                                const moveLen = Math.sqrt(moveX * moveX + moveY * moveY);
+                                if (moveLen > 0) {
+                                    moveX /= moveLen;
+                                    moveY /= moveLen;
+                                }
+
+                                const moveDistance = Math.min(this.speed * deltaTime * 0.7, dist);
+                                this.x += moveX * moveDistance;
+                                this.y += moveY * moveDistance;
+                                this.angle = Math.atan2(moveY, moveX);
+                                this.consumeBatteryForMovement(moveDistance);
+                            }
+                        } else {
+                            // Can squeeze through - move toward goal with slight avoidance
+                            let moveX = dx / dist;
+                            let moveY = dy / dist;
+
+                            const avoidX = this.x - closestObstacle.robot.x;
+                            const avoidY = this.y - closestObstacle.robot.y;
+                            const avoidLen = Math.sqrt(avoidX * avoidX + avoidY * avoidY);
+
+                            if (avoidLen > 0) {
+                                moveX = moveX * 0.7 + (avoidX / avoidLen) * 0.3;
+                                moveY = moveY * 0.7 + (avoidY / avoidLen) * 0.3;
+
+                                const newLen = Math.sqrt(moveX * moveX + moveY * moveY);
+                                if (newLen > 0) {
+                                    moveX /= newLen;
+                                    moveY /= newLen;
+                                }
+                            }
+
+                            const moveDistance = Math.min(this.speed * deltaTime * 0.8, dist);
+                            this.x += moveX * moveDistance;
+                            this.y += moveY * moveDistance;
+                            this.angle = Math.atan2(moveY, moveX);
+                            this.consumeBatteryForMovement(moveDistance);
+                        }
+
+                        this.stuckCounter = Math.max(0, this.stuckCounter - 1);
+                    } else {
+                        // Normal obstacle handling - switch to wall-following mode
+                        this.bug2Mode = 'wall-following';
+                        this.hitPoint = { x: this.x, y: this.y };
+                        this.hitPointDistance = distance(this.x, this.y, this.mLineGoal.x, this.mLineGoal.y);
+                        this.obstacleFollowTimer = 0;
+
+                        // Determine wall follow direction with randomization to break symmetry
+                        const toGoalAngle = Math.atan2(dy, dx);
+                        const toObstacleAngle = Math.atan2(
+                            closestObstacle.robot.y - this.y,
+                            closestObstacle.robot.x - this.x
+                        );
+                        let angleDiff = toGoalAngle - toObstacleAngle + this.avoidanceOffset * 0.1;
+
+                        // Normalize angle difference
+                        while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+                        while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
+                        this.wallFollowDirection = angleDiff > 0 ? 1 : -1;
+
+                        this.stuckCounter++;
+                    }
                 } else {
                     // No obstacle or very close to goal - move toward goal
                     // Add slight randomization to avoid perfect alignment
@@ -368,6 +463,14 @@ class Robot {
                     this.bug2Mode = 'go-to-goal';
                     this.hitPoint = null;
                     this.stuckCounter = 0;
+                }
+                // If stuck on stationary obstacle for too long, force back to go-to-goal mode
+                else if (stuckOnStatic && closestObstacle && closestObstacle.isStatic) {
+                    // Been wall-following a stationary obstacle too long - break free
+                    this.bug2Mode = 'go-to-goal';
+                    this.hitPoint = null;
+                    this.stuckCounter = 0;
+                    // Counter will allow pushing through in go-to-goal mode
                 }
                 // Check if back on m-line and closer to goal
                 else if (this.obstacleFollowTimer > 15 && this.isOnMLineAndCloser()) {
@@ -438,6 +541,8 @@ class Robot {
         // Reached target
         this.stuckCounter = 0;
         this.bug2Mode = 'go-to-goal';
+        this.blockedByRobotId = null;
+        this.blockedByStaticCounter = 0;
         return true;
     }
 
@@ -541,6 +646,8 @@ class Robot {
         this.stuckCounter = 0;
         this.releaseGoal(); // Release any reserved goals
         this.clearancePosition = null;
+        this.blockedByRobotId = null;
+        this.blockedByStaticCounter = 0;
     }
 }
 
