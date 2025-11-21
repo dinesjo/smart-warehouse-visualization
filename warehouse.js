@@ -69,7 +69,7 @@ class Robot {
         this.targetX = x;
         this.targetY = y;
         this.angle = 0;
-        this.speed = 2;
+        this.speed = 150;
         this.state = ROBOT_STATE.IDLE;
         this.battery = 100;
         this.maxBattery = 100;
