@@ -196,6 +196,28 @@ class Robot {
         };
     }
 
+    // Check if goal area is congested with other robots
+    isGoalAreaCongested(allRobots) {
+        const goalCongestedRadius = 40; // Check within 40 pixels of goal
+        let robotsNearGoal = 0;
+
+        for (let robot of allRobots) {
+            if (robot.id === this.id) continue;
+
+            // Check if other robot is very close to MY goal
+            const distToMyGoal = distance(robot.x, robot.y, this.targetX, this.targetY);
+            if (distToMyGoal < goalCongestedRadius) {
+                robotsNearGoal++;
+                // If 2 or more robots are already at/near the goal, it's congested
+                if (robotsNearGoal >= 2) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     update(deltaTime, allRobots = []) {
         // Update position towards target using Bug2 algorithm
         const dx = this.targetX - this.x;
@@ -212,13 +234,59 @@ class Robot {
             const obstacles = this.detectObstacles(allRobots);
             const closestObstacle = this.getClosestObstacleInDirection(obstacles, dx, dy);
 
-            // Very close to goal - be more aggressive
-            const veryCloseToGoal = dist < 30;
+            // Check if goal area is congested (other robots very close to our goal)
+            const goalAreaCongested = this.isGoalAreaCongested(allRobots);
+
+            // Very close to goal - be more aggressive, BUT NOT if goal is congested
+            const veryCloseToGoal = dist < 30 && !goalAreaCongested;
 
             // Bug2 Algorithm State Machine
             if (this.bug2Mode === 'go-to-goal') {
-                // Try to move directly toward goal
-                if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance && !veryCloseToGoal) {
+                // If goal is congested and we're close, wait at a holding distance
+                if (goalAreaCongested && dist < 60) {
+                    // Create a temporary waiting position offset from goal
+                    const waitDistance = 50;
+                    const offsetAngle = this.avoidanceOffset; // Use unique offset per robot
+                    const waitX = this.targetX - Math.cos(offsetAngle) * waitDistance;
+                    const waitY = this.targetY - Math.sin(offsetAngle) * waitDistance;
+
+                    // Move toward waiting position
+                    const waitDx = waitX - this.x;
+                    const waitDy = waitY - this.y;
+                    const waitDist = Math.sqrt(waitDx * waitDx + waitDy * waitDy);
+
+                    if (waitDist > 5) {
+                        let moveX = waitDx / waitDist;
+                        let moveY = waitDy / waitDist;
+
+                        // Still avoid collisions while moving to wait position
+                        if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance) {
+                            const avoidX = this.x - closestObstacle.robot.x;
+                            const avoidY = this.y - closestObstacle.robot.y;
+                            const avoidLen = Math.sqrt(avoidX * avoidX + avoidY * avoidY);
+
+                            if (avoidLen > 0) {
+                                moveX = moveX * 0.5 + (avoidX / avoidLen) * 0.5;
+                                moveY = moveY * 0.5 + (avoidY / avoidLen) * 0.5;
+
+                                const newLen = Math.sqrt(moveX * moveX + moveY * moveY);
+                                if (newLen > 0) {
+                                    moveX /= newLen;
+                                    moveY /= newLen;
+                                }
+                            }
+                        }
+
+                        const moveDistance = Math.min(this.speed * deltaTime * 0.5, waitDist);
+                        this.x += moveX * moveDistance;
+                        this.y += moveY * moveDistance;
+                        this.angle = Math.atan2(moveY, moveX);
+                        this.consumeBatteryForMovement(moveDistance);
+                    }
+                    // Don't increment stuck counter while waiting - this is intentional
+                    this.stuckCounter = Math.max(0, this.stuckCounter - 1);
+
+                } else if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance && !veryCloseToGoal) {
                     // Hit an obstacle - switch to wall-following mode
                     this.bug2Mode = 'wall-following';
                     this.hitPoint = { x: this.x, y: this.y };
