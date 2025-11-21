@@ -81,6 +81,9 @@ class Robot {
         this.stuckCounter = 0;
         this.lastX = x;
         this.lastY = y;
+        this.radarRange = 60; // Detection range for obstacles
+        this.safeDistance = 40; // Minimum safe distance from obstacles
+        this.diagnosticMessages = [];
     }
 
     updateBattery(delta) {
@@ -111,13 +114,25 @@ class Robot {
         this.targetY = targetY;
     }
 
-    update(deltaTime) {
+    update(deltaTime, allRobots = []) {
         // Update position towards target
         const dx = this.targetX - this.x;
         const dy = this.targetY - this.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
 
         if (dist > 1) {
+            // Check radar for safety (PDF requirement)
+            const safeToMove = allRobots.length > 0 ? this.isSafeToMove(allRobots) : true;
+
+            if (!safeToMove) {
+                // Stop or slow down due to obstacle
+                this.stuckCounter++;
+                if (this.stuckCounter > 50) {
+                    this.sendDiagnostic(`Robot ${this.id} blocked by obstacle for extended time`, 'warning');
+                }
+                return false; // Cannot move, obstacle detected
+            }
+
             const moveDistance = Math.min(this.speed * deltaTime, dist);
             this.x += (dx / dist) * moveDistance;
             this.y += (dy / dist) * moveDistance;
@@ -165,6 +180,71 @@ class Robot {
         return distance(this.x, this.y, this.targetX, this.targetY) < 5;
     }
 
+    // Radar: Detect obstacles (other robots) within range
+    detectObstacles(allRobots) {
+        const obstacles = [];
+        for (let robot of allRobots) {
+            if (robot.id === this.id) continue; // Don't detect self
+
+            const dist = distance(this.x, this.y, robot.x, robot.y);
+            if (dist < this.radarRange) {
+                // Determine if moving or static
+                const robotSpeed = Math.sqrt(
+                    Math.pow(robot.x - robot.lastX, 2) +
+                    Math.pow(robot.y - robot.lastY, 2)
+                );
+                const isMoving = robotSpeed > 0.5;
+
+                obstacles.push({
+                    robot: robot,
+                    distance: dist,
+                    isMoving: isMoving,
+                    isStatic: !isMoving
+                });
+            }
+        }
+        return obstacles;
+    }
+
+    // Check if safe to move forward
+    isSafeToMove(allRobots) {
+        const obstacles = this.detectObstacles(allRobots);
+
+        // Check if any obstacle is too close in our direction
+        for (let obs of obstacles) {
+            if (obs.distance < this.safeDistance) {
+                // Check if obstacle is in our path direction
+                const dx = this.targetX - this.x;
+                const dy = this.targetY - this.y;
+                const dxObs = obs.robot.x - this.x;
+                const dyObs = obs.robot.y - this.y;
+
+                // Dot product to check if in same direction
+                const dot = (dx * dxObs + dy * dyObs) /
+                           (Math.sqrt(dx*dx + dy*dy) * Math.sqrt(dxObs*dxObs + dyObs*dyObs));
+
+                if (dot > 0.5) { // Obstacle is ahead
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Send diagnostic message to WMS
+    sendDiagnostic(message, severity = 'info') {
+        this.diagnosticMessages.push({
+            time: Date.now(),
+            severity: severity,
+            message: message
+        });
+    }
+
+    // Weight sensor: Check if box is on robot storage
+    hasBoxOnStorage() {
+        return this.carryingBox !== null;
+    }
+
     reset() {
         this.state = ROBOT_STATE.IDLE;
         this.currentTask = null;
@@ -172,6 +252,7 @@ class Robot {
         this.pathIndex = 0;
         this.carryingBox = null;
         this.armExtended = false;
+        this.stuckCounter = 0;
     }
 }
 
@@ -186,10 +267,12 @@ class WMS {
         this.robots = [];
         this.chargingStations = [];
         this.collectionPoints = [];
-        this.conveyorBelts = [];
+        this.conveyorBelts = []; // Will be initialized with running state
         this.taskQueue = [];
         this.activityLog = [];
         this.conveyorBoxes = [];
+        this.conveyorBeltStates = {}; // Track state of each belt (running/stopped)
+        this.diagnostics = []; // Collect diagnostic messages from robots
     }
 
     initializeShelves() {
@@ -287,13 +370,11 @@ class WMS {
     }
 
     assignTaskToRobot(task) {
-        // Find an idle robot with sufficient battery
-        let availableRobots = this.robots.filter(r =>
-            r.state === ROBOT_STATE.IDLE && !r.needsCharging()
-        );
+        // Find idle robots
+        let idleRobots = this.robots.filter(r => r.state === ROBOT_STATE.IDLE);
 
-        if (availableRobots.length === 0) {
-            // No available robots, queue the task
+        if (idleRobots.length === 0) {
+            // No idle robots, queue the task
             this.taskQueue.push(task);
             return null;
         }
@@ -302,7 +383,7 @@ class WMS {
         let bestRobot = null;
         let minDist = Infinity;
 
-        for (let robot of availableRobots) {
+        for (let robot of idleRobots) {
             const dist = distance(robot.x, robot.y, task.targetX, task.targetY);
             if (dist < minDist) {
                 minDist = dist;
@@ -311,13 +392,60 @@ class WMS {
         }
 
         if (bestRobot) {
-            bestRobot.currentTask = task;
-            this.computeRoute(bestRobot, task);
-            return bestRobot;
+            // Check battery status (as per PDF workflow step 4)
+            if (bestRobot.needsCharging()) {
+                this.log('warning', `Robot ${bestRobot.id} has low battery, sending to charging`);
+                this.sendRobotToCharging(bestRobot);
+
+                // Choose another robot (retry with filtered list)
+                idleRobots = idleRobots.filter(r => r.id !== bestRobot.id && !r.needsCharging());
+                if (idleRobots.length === 0) {
+                    this.taskQueue.push(task);
+                    return null;
+                }
+
+                // Find next closest robot with sufficient battery
+                bestRobot = null;
+                minDist = Infinity;
+                for (let robot of idleRobots) {
+                    const dist = distance(robot.x, robot.y, task.targetX, task.targetY);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        bestRobot = robot;
+                    }
+                }
+            }
+
+            if (bestRobot) {
+                bestRobot.currentTask = task;
+                this.computeRoute(bestRobot, task);
+                return bestRobot;
+            }
         }
 
         this.taskQueue.push(task);
         return null;
+    }
+
+    // Send robot to charging station (called by WMS as per PDF)
+    sendRobotToCharging(robot) {
+        // Find nearest charging station
+        let nearest = null;
+        let minDist = Infinity;
+
+        for (let station of this.chargingStations) {
+            const dist = distance(robot.x, robot.y, station.x, station.y);
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = station;
+            }
+        }
+
+        if (nearest) {
+            robot.moveTo(nearest.x, nearest.y);
+            robot.state = ROBOT_STATE.MOVING_TO_CHARGING;
+            this.log('warning', `WMS commanding Robot ${robot.id} to charging station`);
+        }
     }
 
     computeRoute(robot, task) {
@@ -482,9 +610,36 @@ class RobotController {
     }
 
     update(robot, deltaTime) {
+        // Process diagnostic messages from robot (PDF requirement)
+        if (robot.diagnosticMessages.length > 0) {
+            for (let diag of robot.diagnosticMessages) {
+                this.wms.diagnostics.push({
+                    robotId: robot.id,
+                    ...diag
+                });
+            }
+            robot.diagnosticMessages = [];
+        }
+
+        // Handle stuck robots (PDF requirement)
+        if (robot.stuckCounter > 100 && robot.state !== ROBOT_STATE.IDLE && robot.state !== ROBOT_STATE.CHARGING) {
+            this.wms.log('error', `Robot ${robot.id} stuck for extended time, resetting task`);
+            robot.sendDiagnostic(`Robot stuck, aborting current task`, 'error');
+
+            // Re-queue task if exists
+            if (robot.currentTask) {
+                this.wms.taskQueue.unshift(robot.currentTask);
+            }
+
+            robot.reset();
+            robot.stuckCounter = 0;
+            return;
+        }
+
         // Check for critical battery
         if (robot.isCriticallyLow() && robot.state !== ROBOT_STATE.CHARGING) {
             this.wms.log('error', `Robot ${robot.id} critically low battery - stopping`);
+            robot.sendDiagnostic(`Critical battery level, ceasing operation`, 'critical');
             robot.reset();
             return;
         }
@@ -564,38 +719,61 @@ class RobotController {
     }
 
     handleMovingToCollection(robot, deltaTime) {
-        robot.update(deltaTime);
+        robot.update(deltaTime, this.wms.robots);
 
         if (robot.followPath()) {
+            // Stop conveyor belt for pickup (PDF requirement)
+            const beltId = 0; // Collection point 0
+            this.wms.conveyorBeltStates[beltId] = 'stopped';
+            this.wms.log('info', `Conveyor belt ${beltId} stopped for Robot ${robot.id}`);
+
             robot.state = ROBOT_STATE.PICKING_FROM_CONVEYOR;
         }
     }
 
     handlePickingFromConveyor(robot) {
-        // Simulate arm operation
-        robot.armExtended = true;
-        robot.consumeBatteryForArmOperation();
-
-        // Find box on conveyor
+        // Safety check: verify box is present (PDF requirement)
         const conveyorBoxIndex = this.wms.conveyorBoxes.findIndex(
             cb => cb.box === robot.currentTask.box
         );
 
-        if (conveyorBoxIndex >= 0) {
-            const conveyorBox = this.wms.conveyorBoxes[conveyorBoxIndex];
-            robot.carryingBox = conveyorBox.box;
-            robot.carryingBox.assignedRobot = robot.id;
-            this.wms.conveyorBoxes.splice(conveyorBoxIndex, 1);
-
-            robot.armExtended = false;
-            robot.state = ROBOT_STATE.MOVING_TO_SHELF;
-
-            this.wms.log('success', `Robot ${robot.id} picked up box from conveyor`);
+        if (conveyorBoxIndex < 0) {
+            robot.sendDiagnostic(`Box not found on conveyor for task`, 'error');
+            this.wms.log('error', `Robot ${robot.id} cannot find box on conveyor`);
+            robot.reset();
+            return;
         }
+
+        // Safety check passed, perform arm operation
+        robot.armExtended = true;
+        robot.consumeBatteryForArmOperation();
+
+        const conveyorBox = this.wms.conveyorBoxes[conveyorBoxIndex];
+
+        // Verify RFID (PDF requirement - arm has RFID reader)
+        if (conveyorBox.box.rfid !== robot.currentTask.box.rfid) {
+            robot.sendDiagnostic(`RFID mismatch on conveyor`, 'error');
+            this.wms.log('error', `Robot ${robot.id} RFID mismatch`);
+            robot.armExtended = false;
+            robot.reset();
+            return;
+        }
+
+        robot.carryingBox = conveyorBox.box;
+        robot.carryingBox.assignedRobot = robot.id;
+        this.wms.conveyorBoxes.splice(conveyorBoxIndex, 1);
+
+        robot.armExtended = false;
+        robot.state = ROBOT_STATE.MOVING_TO_SHELF;
+
+        // Resume conveyor belt (PDF requirement)
+        const beltId = 0;
+        this.wms.conveyorBeltStates[beltId] = 'running';
+        this.wms.log('success', `Robot ${robot.id} picked up box, conveyor belt ${beltId} resumed`);
     }
 
     handleMovingToShelf(robot, deltaTime) {
-        robot.update(deltaTime);
+        robot.update(deltaTime, this.wms.robots);
 
         if (robot.followPath()) {
             robot.state = ROBOT_STATE.PLACING_ON_SHELF;
@@ -603,10 +781,38 @@ class RobotController {
     }
 
     handlePlacingOnShelf(robot) {
+        // Safety checks before placing (PDF requirement)
+        const task = robot.currentTask;
+
+        // Check if robot has box in storage (weight sensor)
+        if (!robot.hasBoxOnStorage()) {
+            robot.sendDiagnostic(`No box on storage to place`, 'error');
+            this.wms.log('error', `Robot ${robot.id} has no box to place`);
+            robot.reset();
+            return;
+        }
+
+        // Check if shelf location is valid and empty
+        const shelf = this.wms.shelves.find(s => s.id === task.location.shelf);
+        if (!shelf || !shelf.levels[task.location.level]) {
+            robot.sendDiagnostic(`Invalid shelf location`, 'error');
+            this.wms.log('error', `Robot ${robot.id} invalid shelf location`);
+            robot.reset();
+            return;
+        }
+
+        const currentBox = shelf.levels[task.location.level].positions[task.location.position];
+        if (currentBox !== null) {
+            robot.sendDiagnostic(`Shelf position already occupied`, 'error');
+            this.wms.log('error', `Robot ${robot.id} shelf position occupied`);
+            robot.reset();
+            return;
+        }
+
+        // Safety checks passed, perform operation
         robot.armExtended = true;
         robot.consumeBatteryForArmOperation();
 
-        const task = robot.currentTask;
         if (this.wms.placeBoxInLocation(robot.carryingBox, task.location)) {
             this.wms.log('success',
                 `Robot ${robot.id} placed box at (${task.location.shelf},${task.location.level},${task.location.position})`
@@ -619,7 +825,7 @@ class RobotController {
     }
 
     handleMovingToFetch(robot, deltaTime) {
-        robot.update(deltaTime);
+        robot.update(deltaTime, this.wms.robots);
 
         if (robot.followPath()) {
             robot.state = ROBOT_STATE.PICKING_FROM_SHELF;
@@ -627,10 +833,38 @@ class RobotController {
     }
 
     handlePickingFromShelf(robot) {
+        const task = robot.currentTask;
+
+        // Safety checks before picking (PDF requirement)
+        const shelf = this.wms.shelves.find(s => s.id === task.location.shelf);
+        if (!shelf || !shelf.levels[task.location.level]) {
+            robot.sendDiagnostic(`Invalid shelf location`, 'error');
+            this.wms.log('error', `Robot ${robot.id} invalid shelf location`);
+            robot.reset();
+            return;
+        }
+
+        // Check if box exists at location
+        const rfidAtLocation = shelf.levels[task.location.level].positions[task.location.position];
+        if (!rfidAtLocation) {
+            robot.sendDiagnostic(`No box at shelf location`, 'error');
+            this.wms.log('error', `Robot ${robot.id} no box at shelf location`);
+            robot.reset();
+            return;
+        }
+
+        // Verify RFID matches (PDF requirement - arm has RFID reader)
+        if (rfidAtLocation !== task.box.rfid) {
+            robot.sendDiagnostic(`RFID mismatch at shelf`, 'error');
+            this.wms.log('error', `Robot ${robot.id} RFID mismatch at shelf`);
+            robot.reset();
+            return;
+        }
+
+        // Safety checks passed, perform operation
         robot.armExtended = true;
         robot.consumeBatteryForArmOperation();
 
-        const task = robot.currentTask;
         const rfid = this.wms.removeBoxFromLocation(task.location);
 
         if (rfid) {
@@ -647,7 +881,7 @@ class RobotController {
     }
 
     handleMovingToDelivery(robot, deltaTime) {
-        robot.update(deltaTime);
+        robot.update(deltaTime, this.wms.robots);
 
         if (robot.followPath()) {
             robot.state = ROBOT_STATE.PLACING_ON_CONVEYOR;
@@ -655,10 +889,18 @@ class RobotController {
     }
 
     handlePlacingOnConveyor(robot) {
+        // Safety check: verify robot has box
+        if (!robot.hasBoxOnStorage()) {
+            robot.sendDiagnostic(`No box to place on conveyor`, 'error');
+            this.wms.log('error', `Robot ${robot.id} has no box to deliver`);
+            robot.reset();
+            return;
+        }
+
         robot.armExtended = true;
         robot.consumeBatteryForArmOperation();
 
-        // Remove box from system
+        // Remove box from system (shipped out)
         this.wms.boxes.delete(robot.carryingBox.rfid);
         this.wms.log('success', `Robot ${robot.id} delivered box to conveyor`);
 
@@ -668,7 +910,7 @@ class RobotController {
     }
 
     handleMovingToCharging(robot, deltaTime) {
-        robot.update(deltaTime);
+        robot.update(deltaTime, this.wms.robots);
 
         if (robot.isAtTarget()) {
             robot.state = ROBOT_STATE.CHARGING;
@@ -1038,7 +1280,11 @@ class WarehouseSimulation {
             { x: 1100, y: 700 }
         ];
 
-        // Initialize robots around charging stations
+        // Initialize conveyor belt states (PDF requirement)
+        this.wms.conveyorBeltStates[0] = 'running'; // Top belt
+        this.wms.conveyorBeltStates[1] = 'running'; // Bottom belt
+
+        // Initialize robots around charging stations (PDF requirement)
         for (let i = 0; i < WAREHOUSE.NUM_ROBOTS; i++) {
             const station = this.wms.chargingStations[i % this.wms.chargingStations.length];
             const offset = Math.floor(i / this.wms.chargingStations.length) * 40;
@@ -1047,10 +1293,11 @@ class WarehouseSimulation {
                 station.x + offset,
                 station.y + offset
             );
+            // Robots start fully charged and distributed around charging stations (PDF)
             this.wms.robots.push(robot);
         }
 
-        this.wms.log('success', 'Warehouse initialized with 10 robots and 20 shelves');
+        this.wms.log('success', 'Warehouse initialized with 10 robots, 20 shelves, fully charged robots');
     }
 
     update() {
