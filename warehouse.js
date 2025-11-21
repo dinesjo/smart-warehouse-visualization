@@ -887,6 +887,21 @@ class WMS {
         return this.robots.filter(r => r.state !== ROBOT_STATE.IDLE).length;
     }
 
+    // Check if a goal location is already reserved by another robot
+    isGoalReserved(x, y, excludeRobotId = null) {
+        for (let robot of this.robots) {
+            if (robot.id === excludeRobotId) continue;
+
+            if (robot.reservedGoal) {
+                const dist = distance(robot.reservedGoal.x, robot.reservedGoal.y, x, y);
+                if (dist < 30) {
+                    return true; // Goal is already reserved
+                }
+            }
+        }
+        return false;
+    }
+
     // WMS periodic route replanning (PDF Step 7)
     // Re-analyzes robot positions and recomputes routes when needed
     replanRoutes() {
@@ -1030,23 +1045,47 @@ class RobotController {
         // Check if robot has a task
         if (robot.currentTask) {
             if (robot.currentTask.type === 'store') {
-                // Reserve the collection point goal
+                // Check if collection point is available
                 const collectionPoint = this.wms.collectionPoints[0];
-                robot.reserveGoal(collectionPoint.x + 80, collectionPoint.y, 'collection');
+                const goalX = collectionPoint.x + 80;
+                const goalY = collectionPoint.y;
 
+                // Robot-to-robot communication: Check if goal is already reserved
+                if (this.wms.isGoalReserved(goalX, goalY, robot.id)) {
+                    // Goal is reserved by another robot, wait for it to become available
+                    // Put task back in queue and become idle
+                    this.wms.taskQueue.unshift(robot.currentTask);
+                    robot.currentTask = null;
+                    return;
+                }
+
+                // Reserve the collection point goal
+                robot.reserveGoal(goalX, goalY, 'collection');
                 robot.state = ROBOT_STATE.MOVING_TO_COLLECTION;
                 this.wms.log('success', `Robot ${robot.id} assigned to store box`);
             } else if (robot.currentTask.type === 'fetch') {
-                // Reserve the shelf goal
+                // Get shelf coordinates
                 const coords = this.wms.getShelfCoordinates(
                     robot.currentTask.location.shelf,
                     robot.currentTask.location.level,
                     robot.currentTask.location.position
                 );
-                if (coords) {
-                    robot.reserveGoal(coords.x, coords.y, 'shelf');
+
+                if (!coords) {
+                    robot.reset();
+                    return;
                 }
 
+                // Robot-to-robot communication: Check if shelf goal is already reserved
+                if (this.wms.isGoalReserved(coords.x, coords.y, robot.id)) {
+                    // Goal is reserved, wait
+                    this.wms.taskQueue.unshift(robot.currentTask);
+                    robot.currentTask = null;
+                    return;
+                }
+
+                // Reserve the shelf goal
+                robot.reserveGoal(coords.x, coords.y, 'shelf');
                 robot.state = ROBOT_STATE.MOVING_TO_FETCH;
                 this.wms.log('success', `Robot ${robot.id} assigned to fetch box`);
             }
@@ -1119,6 +1158,26 @@ class RobotController {
             task.location.position
         );
         if (coords) {
+            // Check if shelf is already reserved by another robot
+            if (this.wms.isGoalReserved(coords.x, coords.y, robot.id)) {
+                // Shelf is busy, put box back and retry later
+                this.wms.conveyorBoxes.push({
+                    box: robot.carryingBox,
+                    x: this.wms.collectionPoints[0].x + 50,
+                    y: this.wms.collectionPoints[0].y,
+                    targetLocation: task.location
+                });
+                robot.carryingBox = null;
+                this.wms.taskQueue.unshift(task);
+                robot.reset();
+
+                // Resume conveyor belt
+                const beltId = 0;
+                this.wms.conveyorBeltStates[beltId] = 'running';
+                this.wms.log('warning', `Robot ${robot.id} shelf busy, box returned to conveyor`);
+                return;
+            }
+
             robot.reserveGoal(coords.x, coords.y, 'shelf');
         }
 
@@ -1251,8 +1310,22 @@ class RobotController {
 
             // Reserve delivery point goal
             const deliveryPoint = this.wms.collectionPoints[1];
-            robot.reserveGoal(deliveryPoint.x + 80, deliveryPoint.y, 'delivery');
+            const deliveryX = deliveryPoint.x + 80;
+            const deliveryY = deliveryPoint.y;
 
+            // Check if delivery point is available
+            if (this.wms.isGoalReserved(deliveryX, deliveryY, robot.id)) {
+                // Delivery point busy, put box back and retry
+                this.wms.placeBoxInLocation(robot.carryingBox, task.location);
+                robot.carryingBox = null;
+                this.wms.taskQueue.unshift(task);
+                robot.reset();
+                this.wms.log('warning', `Robot ${robot.id} delivery point busy, box returned to shelf`);
+                robot.armExtended = false;
+                return;
+            }
+
+            robot.reserveGoal(deliveryX, deliveryY, 'delivery');
             robot.state = ROBOT_STATE.MOVING_TO_DELIVERY;
 
             this.wms.log('success',
