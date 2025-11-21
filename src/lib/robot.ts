@@ -206,6 +206,9 @@ export class Robot {
       if (this.route.length > 0) {
         this.targetPosition = this.route[0];
         this.status = 'moving';
+      } else {
+        // Clear the route when empty so new routes can be synced
+        this.route = undefined;
       }
     }
   }

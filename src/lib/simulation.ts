@@ -161,7 +161,10 @@ export class SimulationEngine {
 
       // Sync route from WMS to robot instance (only if robot doesn't already have a route)
       const robotStatus = this.wms.getRobots().find((r) => r.id === robotId);
-      if (robotStatus?.route && robotStatus.route.length > 0 && !robot.route && robot.status === 'idle') {
+      const robotHasNoRoute = !robot.route || robot.route.length === 0;
+      const robotIsIdle = robot.status === 'idle';
+
+      if (robotStatus?.route && robotStatus.route.length > 0 && robotHasNoRoute && robotIsIdle) {
         // Robot has a route in WMS but not in instance, and robot is idle - sync it
         robot.setRoute(robotStatus.route);
       }
