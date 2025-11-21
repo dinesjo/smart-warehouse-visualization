@@ -93,6 +93,7 @@ class Robot {
         this.hitPointDistance = Infinity; // Distance from hit point to goal
         this.wallFollowDirection = 1; // 1 for counterclockwise, -1 for clockwise
         this.obstacleFollowTimer = 0;
+        this.avoidanceOffset = Math.random() * Math.PI * 2; // Random offset for collision resolution
     }
 
     updateBattery(delta) {
@@ -202,46 +203,88 @@ class Robot {
         const dist = Math.sqrt(dx * dx + dy * dy);
 
         if (dist > 1) {
+            // Adaptive safe distance based on proximity to goal
+            const adaptiveSafeDistance = dist < 100 ?
+                Math.max(25, this.safeDistance * (dist / 100)) :
+                this.safeDistance;
+
             // Detect obstacles
             const obstacles = this.detectObstacles(allRobots);
             const closestObstacle = this.getClosestObstacleInDirection(obstacles, dx, dy);
 
+            // Very close to goal - be more aggressive
+            const veryCloseToGoal = dist < 30;
+
             // Bug2 Algorithm State Machine
             if (this.bug2Mode === 'go-to-goal') {
                 // Try to move directly toward goal
-                if (closestObstacle && closestObstacle.distance < this.safeDistance) {
+                if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance && !veryCloseToGoal) {
                     // Hit an obstacle - switch to wall-following mode
                     this.bug2Mode = 'wall-following';
                     this.hitPoint = { x: this.x, y: this.y };
                     this.hitPointDistance = distance(this.x, this.y, this.mLineGoal.x, this.mLineGoal.y);
                     this.obstacleFollowTimer = 0;
 
-                    // Determine wall follow direction (choose direction that moves toward goal)
+                    // Determine wall follow direction with randomization to break symmetry
                     const toGoalAngle = Math.atan2(dy, dx);
                     const toObstacleAngle = Math.atan2(
                         closestObstacle.robot.y - this.y,
                         closestObstacle.robot.x - this.x
                     );
-                    const angleDiff = toGoalAngle - toObstacleAngle;
+                    let angleDiff = toGoalAngle - toObstacleAngle + this.avoidanceOffset * 0.1;
+
+                    // Normalize angle difference
+                    while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+                    while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
                     this.wallFollowDirection = angleDiff > 0 ? 1 : -1;
 
                     this.stuckCounter++;
                 } else {
-                    // No obstacle, move toward goal
+                    // No obstacle or very close to goal - move toward goal
+                    // Add slight randomization to avoid perfect alignment
+                    let moveX = dx / dist;
+                    let moveY = dy / dist;
+
+                    if (closestObstacle && closestObstacle.distance < adaptiveSafeDistance * 1.5) {
+                        // Slight avoidance even when moving to goal
+                        const avoidX = this.x - closestObstacle.robot.x;
+                        const avoidY = this.y - closestObstacle.robot.y;
+                        const avoidLen = Math.sqrt(avoidX * avoidX + avoidY * avoidY);
+
+                        if (avoidLen > 0) {
+                            const avoidWeight = 0.2;
+                            moveX = moveX * (1 - avoidWeight) + (avoidX / avoidLen) * avoidWeight;
+                            moveY = moveY * (1 - avoidWeight) + (avoidY / avoidLen) * avoidWeight;
+
+                            const newLen = Math.sqrt(moveX * moveX + moveY * moveY);
+                            if (newLen > 0) {
+                                moveX /= newLen;
+                                moveY /= newLen;
+                            }
+                        }
+                    }
+
                     const moveDistance = Math.min(this.speed * deltaTime, dist);
-                    this.x += (dx / dist) * moveDistance;
-                    this.y += (dy / dist) * moveDistance;
-                    this.angle = Math.atan2(dy, dx);
+                    this.x += moveX * moveDistance;
+                    this.y += moveY * moveDistance;
+                    this.angle = Math.atan2(moveY, moveX);
                     this.consumeBatteryForMovement(moveDistance);
-                    this.stuckCounter = 0;
+                    this.stuckCounter = Math.max(0, this.stuckCounter - 1);
                 }
 
             } else if (this.bug2Mode === 'wall-following') {
                 // Follow the obstacle boundary
                 this.obstacleFollowTimer++;
 
+                // Exit wall-following if very close to goal
+                if (veryCloseToGoal) {
+                    this.bug2Mode = 'go-to-goal';
+                    this.hitPoint = null;
+                    this.stuckCounter = 0;
+                }
                 // Check if back on m-line and closer to goal
-                if (this.obstacleFollowTimer > 20 && this.isOnMLineAndCloser()) {
+                else if (this.obstacleFollowTimer > 15 && this.isOnMLineAndCloser()) {
                     // Leave wall and go back to goal mode
                     this.bug2Mode = 'go-to-goal';
                     this.hitPoint = null;
@@ -250,9 +293,9 @@ class Robot {
                     // Calculate tangent direction (perpendicular to obstacle)
                     const tangent = this.calculateWallFollowDirection(closestObstacle.robot);
 
-                    // Also consider goal direction to bias movement
-                    const goalWeight = 0.3;
-                    const tangentWeight = 0.7;
+                    // Increase goal weight as we get closer to goal
+                    const goalWeight = Math.min(0.6, 0.3 + (100 - dist) / 200);
+                    const tangentWeight = 1 - goalWeight;
 
                     let moveX = tangent.x * tangentWeight + (dx / dist) * goalWeight;
                     let moveY = tangent.y * tangentWeight + (dy / dist) * goalWeight;
@@ -265,16 +308,17 @@ class Robot {
                     }
 
                     // Check if this direction is safe
+                    const lookAheadDist = 15;
                     const testDist = distance(
-                        this.x + moveX * 20,
-                        this.y + moveY * 20,
+                        this.x + moveX * lookAheadDist,
+                        this.y + moveY * lookAheadDist,
                         closestObstacle.robot.x,
                         closestObstacle.robot.y
                     );
 
-                    if (testDist > this.safeDistance - 10) {
+                    if (testDist > adaptiveSafeDistance - 15) {
                         // Safe to move in this direction
-                        const moveDistance = Math.min(this.speed * deltaTime * 0.8, dist);
+                        const moveDistance = Math.min(this.speed * deltaTime * 0.9, dist);
                         this.x += moveX * moveDistance;
                         this.y += moveY * moveDistance;
                         this.angle = Math.atan2(moveY, moveX);
@@ -282,7 +326,7 @@ class Robot {
                         this.stuckCounter = Math.max(0, this.stuckCounter - 1);
                     } else {
                         // Still too close, try flipping direction
-                        if (this.obstacleFollowTimer % 30 === 0) {
+                        if (this.obstacleFollowTimer % 20 === 0) {
                             this.wallFollowDirection *= -1;
                         }
                         this.stuckCounter++;
